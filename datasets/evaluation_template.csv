@@ -1,0 +1,4 @@
+case_id,expected_eligibility,predicted_eligibility,expected_funding,predicted_funding,expected_title,predicted_title
+TEST001,Eligible,,Fully Funded,,,
+TEST002,Not Eligible,,Partially Funded,,,
+TEST003,Unknown,,Unknown,,,
