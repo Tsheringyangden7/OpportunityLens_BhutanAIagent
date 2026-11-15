@@ -333,14 +333,29 @@ defaults = {
     "assessment_notice": "",
     "assessment_error": None,
     "navigation": "Dashboard",
+    "pending_navigation": None,
     "profile_id": "student01",
     "loaded_profile_id": None,
     "history_view_id": None,
+    "pending_delete_one": None,
+    "pending_delete_all": False,
 }
 
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
+
+
+# IMPORTANT:
+# Apply pending navigation BEFORE creating the sidebar radio widget.
+# This prevents StreamlitWidgetAlreadyInstantiatedError.
+
+pending_page = st.session_state.pending_navigation
+
+if pending_page in PAGES:
+    st.session_state.navigation = pending_page
+
+st.session_state.pending_navigation = None
 
 
 # ============================================================
@@ -461,10 +476,80 @@ def result_as_text(result):
     )
 
 
+# ------------------------------------------------------------
+# HISTORY NORMALIZATION
+# ------------------------------------------------------------
+
 def get_history(profile_id):
 
     try:
-        return recent_assessments(profile_id, limit=500)
+        records = recent_assessments(profile_id, limit=500)
+
+        if records is None:
+            return []
+
+        if isinstance(records, pd.DataFrame):
+            records = records.to_dict("records")
+
+        normalized = []
+
+        for item in records:
+
+            try:
+
+                if hasattr(item, "keys"):
+                    row = dict(item)
+                elif isinstance(item, dict):
+                    row = item
+                else:
+                    continue
+
+                raw_id = (
+                    row.get("ID")
+                    or row.get("id")
+                    or row.get("assessment_id")
+                )
+
+                if raw_id is None or str(raw_id).strip() == "":
+                    continue
+
+                try:
+                    assessment_id = int(raw_id)
+                except (ValueError, TypeError, OverflowError):
+                    continue
+
+                opportunity = (
+                    row.get("Opportunity")
+                    or row.get("opportunity")
+                    or row.get("title")
+                    or "Opportunity assessment"
+                )
+
+                date_value = (
+                    row.get("Date")
+                    or row.get("date")
+                    or row.get("created_at")
+                    or "Unknown date"
+                )
+
+                result_value = (
+                    row.get("Result")
+                    or row.get("result")
+                    or row.get("eligibility")
+                    or "Not assessed"
+                )
+
+                normalized.append({
+                    "ID": assessment_id,
+                    "Opportunity": str(opportunity),
+                    "Date": str(date_value),
+                    "Result": str(result_value),
+                })
+
+            except Exception:
+                continue
+
+        return normalized
 
     except Exception as error:
         st.warning(f"Could not load assessment history: {error}")
@@ -500,7 +585,11 @@ def render_section_card(title, content, help_text=None):
 
 def set_navigation(page):
 
-    st.session_state.navigation = page
+    # This function is used only as a button callback.
+    # Streamlit executes callbacks before creating the widgets.
+
+    if page in PAGES:
+        st.session_state.navigation = page
 
 
 def format_score(eligibility):
@@ -831,6 +920,8 @@ with st.sidebar:
         st.session_state.assessment_result = None
         st.session_state.assessment_notice = ""
         st.session_state.history_view_id = None
+        st.session_state.pending_delete_one = None
+        st.session_state.pending_delete_all = False
 
         st.rerun()
 
@@ -1082,6 +1173,7 @@ elif selected_page == "New Assessment":
         "🔎 Investigate opportunity",
         type="primary",
         use_container_width=True,
+        key="run_new_assessment",
     ):
 
         notice = pasted_notice.strip()
@@ -1169,14 +1261,11 @@ elif selected_page == "New Assessment":
                 result,
             )
 
-            st.success("Assessment completed and saved!")
+            # FIX:
+            # Do not modify the navigation widget's key here.
+            # Queue the destination for the next script run.
 
-            st.info(
-                "Your assessment is ready. Open Latest Results "
-                "in the sidebar to review it."
-            )
-
-            st.session_state.navigation = "Latest Results"
+            st.session_state.pending_navigation = "Latest Results"
 
             st.rerun()
 
@@ -1206,12 +1295,12 @@ elif selected_page == "Latest Results":
             "assessments can be reviewed in Assessment History."
         )
 
-        if st.button(
+        st.button(
             "Start a new assessment",
             use_container_width=True,
-        ):
-            set_navigation("New Assessment")
-            st.rerun()
+            on_click=set_navigation,
+            args=("New Assessment",),
+        )
 
     else:
 
@@ -1249,11 +1338,26 @@ elif selected_page == "Assessment History":
         unsafe_allow_html=True,
     )
 
+    if total > len(history):
+
+        st.warning(
+            "Some database records do not have a valid ID. "
+            "Those records cannot be opened or deleted individually. "
+            "You can still use the delete-all option below to clear "
+            "the history for this profile."
+        )
+
     if not history:
 
-        st.info(
-            "No saved assessments were found for this profile."
-        )
+        if total == 0:
+            st.info(
+                "No saved assessments were found for this profile."
+            )
+        else:
+            st.info(
+                "Assessment records exist, but none has a valid ID "
+                "for individual access."
+            )
 
         st.button(
             "Create your first assessment",
@@ -1297,6 +1401,7 @@ elif selected_page == "Assessment History":
             data=history_df.to_csv(index=False),
             file_name="opportunitylens_history.csv",
             mime="text/csv",
+            key="history_csv_download",
         )
 
         st.markdown("---")
@@ -1306,7 +1411,8 @@ elif selected_page == "Assessment History":
 
         for item in history:
 
-            assessment_id = int(item["ID"])
+            # IDs have already been validated by get_history().
+            assessment_id = item["ID"]
 
             label = (
                 f"#{assessment_id} · "
@@ -1342,6 +1448,12 @@ elif selected_page == "Assessment History":
 
         historical_id = st.session_state.history_view_id
 
+        valid_ids = {item["ID"] for item in history}
+
+        if historical_id is not None and historical_id not in valid_ids:
+            st.session_state.history_view_id = None
+            historical_id = None
+
         if historical_id is not None:
 
             historical_record = get_assessment(
@@ -1362,6 +1474,10 @@ elif selected_page == "Assessment History":
 
                 st.markdown("---")
 
+                historical_result = safe_json(
+                    historical_record["result"]
+                )
+
                 st.markdown(
                     f"## Historical report: "
                     f"{historical_record['opportunity']}"
@@ -1372,8 +1488,15 @@ elif selected_page == "Assessment History":
                     f"Saved: {historical_record['created_at']}"
                 )
 
+                historical_notice = (
+                    historical_record.get("notice")
+                    or historical_record.get("announcement")
+                    or historical_record.get("source_notice")
+                )
+
                 render_assessment_result(
-                    historical_record["result"],
+                    historical_result,
+                    source_notice=historical_notice,
                     download_prefix=(
                         f"historical_assessment_{historical_record['id']}"
                     ),
@@ -1399,76 +1522,156 @@ elif selected_page == "Assessment History":
         )
 
         delete_id = assessment_options[delete_label]
-
-        confirm_one = st.checkbox(
-            "I understand that this assessment will be permanently deleted.",
-            key="confirm_delete_one",
-        )
+        delete_title = delete_label
 
         if st.button(
-            "🗑️ Delete selected assessment",
-            disabled=not confirm_one,
+            "Prepare deletion",
             use_container_width=True,
-            key="delete_one_assessment_button",
+            key="prepare_delete_one",
         ):
 
-            deleted = delete_assessment(
-                current_profile_id,
-                delete_id,
+            st.session_state.pending_delete_one = delete_id
+            st.rerun()
+
+        if st.session_state.pending_delete_one is not None:
+
+            pending_id = st.session_state.pending_delete_one
+
+            pending_title = next(
+                (
+                    label
+                    for label, value in assessment_options.items()
+                    if value == pending_id
+                ),
+                None,
             )
 
-            if deleted:
+            if pending_title is None:
 
-                if st.session_state.history_view_id == delete_id:
+                st.session_state.pending_delete_one = None
+                st.rerun()
+
+            st.error(
+                f"Confirm permanent deletion of: {pending_title}"
+            )
+
+            confirm_col, cancel_col = st.columns(2)
+
+            with confirm_col:
+
+                if st.button(
+                    "Confirm deletion",
+                    type="primary",
+                    use_container_width=True,
+                    key="confirm_delete_one_button",
+                ):
+
+                    deleted = delete_assessment(
+                        current_profile_id,
+                        pending_id,
+                    )
+
+                    st.session_state.pending_delete_one = None
+
+                    if st.session_state.history_view_id == pending_id:
+                        st.session_state.history_view_id = None
+
+                    if deleted:
+                        st.success("Assessment deleted successfully.")
+                    else:
+                        st.error(
+                            "The assessment could not be found or deleted."
+                        )
+
+                    st.rerun()
+
+            with cancel_col:
+
+                if st.button(
+                    "Cancel",
+                    use_container_width=True,
+                    key="cancel_delete_one_button",
+                ):
+
+                    st.session_state.pending_delete_one = None
+                    st.rerun()
+
+    # --------------------------------------------------------
+    # DELETE ALL HISTORY
+    # --------------------------------------------------------
+
+    st.markdown("---")
+
+    st.markdown("### Delete all assessment history")
+
+    st.warning(
+        f"This will permanently delete all {total} assessment "
+        f"records belonging to profile '{current_profile_id}'. "
+        "Your applicant profile and other profiles will not be deleted."
+    )
+
+    if st.button(
+        "Prepare deletion of all history",
+        use_container_width=True,
+        key="prepare_delete_all",
+        disabled=total == 0,
+    ):
+
+        st.session_state.pending_delete_all = True
+        st.rerun()
+
+    if st.session_state.pending_delete_all:
+
+        st.error(
+            f"Are you sure you want to permanently delete all "
+            f"{total} assessment records for profile "
+            f"'{current_profile_id}'?"
+        )
+
+        confirm_all_col, cancel_all_col = st.columns(2)
+
+        with confirm_all_col:
+
+            if st.button(
+                "Yes, delete all history",
+                type="primary",
+                use_container_width=True,
+                key="confirm_delete_all_button",
+            ):
+
+                try:
+
+                    deleted_count = delete_all_assessments(
+                        current_profile_id
+                    )
+
                     st.session_state.history_view_id = None
+                    st.session_state.pending_delete_one = None
+                    st.session_state.pending_delete_all = False
 
-                st.success("Assessment deleted successfully.")
+                    st.success(
+                        f"Successfully deleted {deleted_count} "
+                        "assessment record(s)."
+                    )
+
+                except Exception as error:
+
+                    st.error(
+                        f"Could not delete assessment history: {error}"
+                    )
 
                 st.rerun()
 
-            else:
+        with cancel_all_col:
 
-                st.error(
-                    "The assessment could not be found or deleted."
-                )
+            if st.button(
+                "Cancel",
+                use_container_width=True,
+                key="cancel_delete_all_button",
+            ):
 
-        # ----------------------------------------------------
-        # DELETE ALL HISTORY
-        # ----------------------------------------------------
-
-        st.markdown("---")
-
-        st.markdown("### Delete all assessment history")
-
-        st.warning(
-            f"This will permanently delete all {total} assessment "
-            f"records belonging to profile '{current_profile_id}'. "
-            "Your applicant profile and other profiles will not be deleted."
-        )
-
-        confirm_all = st.checkbox(
-            "I understand that ALL assessment history for this profile will be permanently deleted.",
-            key="confirm_delete_all",
-        )
-
-        if st.button(
-            "🗑️ Delete ALL history for this profile",
-            disabled=not confirm_all,
-            use_container_width=True,
-            key="delete_all_assessments_button",
-        ):
-
-            deleted_count = delete_all_assessments(
-                current_profile_id
-            )
-
-            st.session_state.history_view_id = None
-
-            st.success(
-                f"Successfully deleted {deleted_count} assessment record(s)."
-            )
-
-            st.rerun()
+                st.session_state.pending_delete_all = False
+                st.rerun()
 
 
 # ============================================================
